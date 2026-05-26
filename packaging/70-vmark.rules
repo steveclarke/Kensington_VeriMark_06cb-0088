@@ -1,0 +1,14 @@
+# Kensington VeriMark Fingerprint Key - udev rule
+#
+# Grants the active console user (logged in via systemd-logind) direct
+# USB access to the device. fprintd does not need this rule when running
+# as a system service; it is intended for development / direct use of
+# libfprint examples without sudo.
+#
+# Install: copy to /etc/udev/rules.d/70-vmark.rules, then:
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="0088", TAG+="uaccess", MODE="0660"
