@@ -1361,6 +1361,18 @@ validity_capture_response_cb (FpDevice     *device,
                               gsize         plain_len,
                               gpointer      user_data)
 {
+  {
+    const gchar *dump = g_getenv ("VALIDITY0088_DUMP_CAPRSP");
+    if (dump != NULL)
+      {
+        g_autoptr(GError) derr = NULL;
+        if (g_file_set_contents (dump, (const gchar *) plain, (gssize) plain_len, &derr))
+          fp_dbg ("capture response: dumped %zu B to %s", plain_len, dump);
+        else
+          fp_warn ("capture response: dump failed: %s", derr->message);
+      }
+  }
+
   if (plain_len == VALIDITY_MATCH_RESPONSE_LEN)
     {
       const ValidityMatchResponse *match = (const ValidityMatchResponse *) plain;
@@ -1624,6 +1636,7 @@ typedef enum {
   ENROLL_S_SESSION_PREP,
   ENROLL_S_STAGE_BEGIN,
   ENROLL_S_STAGE_SCAN_SETUP,
+  ENROLL_S_CAPTURE_STOP,
   ENROLL_S_GLOW_START,
   ENROLL_S_CAPTURE,
   ENROLL_S_CALIB_READ,
@@ -1751,56 +1764,72 @@ validity_calib_line (void)
   return 0x38;
 }
 
-/* sensor.py:patch_timeslot_again() over one 0x34 chunk payload. */
+/* Locate the calibration Write Register via the program's own line_update
+ * chunk (0x30) rather than by walking the timeslot table.
+ *
+ * The timeslot chunk does NOT start with code: line_update_type_1() builds it
+ * as get_key_line() + tst[line_width:], so the head is key-line data and a
+ * naive instruction walk desynchronises immediately (it dies at 0x16 here).
+ *
+ * The 0x30 chunk carries the real offsets. Layout:
+ *   <u32 count> then count x <u32 mask><u32 flags>
+ * where flags = (insn_pc + 1) | (group << 20) | 0x7000000. So insn_pc is
+ * (flags & 0xfffff) - 1, and sensor.py patches the byte at insn_pc + 1 -
+ * i.e. exactly the byte the flags field points at.
+ *
+ * Verified on this device: line 1 has flags 0x073000b5 -> the instruction at
+ * 0xb4 is 4f 80 00, a Write Register to 0x8000203c holding 0x80. */
 static gboolean
-validity_patch_timeslot (guint8 *tst, gsize tst_len, guint8 value)
+validity_patch_timeslot (guint8       *tst,
+                         gsize         tst_len,
+                         const guint8 *lu,
+                         gsize         lu_len,
+                         guint8        value)
 {
-  gsize pc = 0;
-  gssize call_dest = -1;
-  gssize match = -1;
-  gint op;
-  gsize l;
+  guint32 count;
+  gsize off;
+  guint32 reg_want = validity_calib_reg ();
+  gboolean done = FALSE;
 
-  /* last Call in the table */
-  while (pc < tst_len)
+  if (lu == NULL || lu_len < 4)
     {
-      l = validity_decode_insn (tst + pc, tst_len - pc, &op);
-      if (l == 0 || op == 1 || op == 2 || op == 4)
-        break;
-      if (op == 11)
-        call_dest = (gssize) tst[pc + 1] << 2;
-      pc += l;
-    }
-
-  if (call_dest < 0 || (gsize) call_dest >= tst_len)
-    {
-      fp_dbg ("calib: no Call found in timeslot table (dest=%" G_GSSIZE_FORMAT ")", call_dest);
+      fp_dbg ("calib: no line_update (0x30) chunk, cannot locate register write");
       return FALSE;
     }
 
-  /* last Write Register to 0x8000203c after it */
-  pc = (gsize) call_dest;
-  while (pc < tst_len)
+  count = (guint32) lu[0] | ((guint32) lu[1] << 8) |
+          ((guint32) lu[2] << 16) | ((guint32) lu[3] << 24);
+  fp_dbg ("calib: line_update has %u lines", count);
+
+  off = 4;
+  for (guint32 i = 0; i < count && off + 8 <= lu_len; i++, off += 8)
     {
-      l = validity_decode_insn (tst + pc, tst_len - pc, &op);
-      if (l == 0 || op == 1 || op == 2 || op == 4)
-        break;
-      if (op == 13 && ((guint32) (tst[pc] & 0x3f) * 4 + 0x80002000) == validity_calib_reg ())
-        match = (gssize) pc;
-      pc += l;
+      guint32 flags = (guint32) lu[off + 4] | ((guint32) lu[off + 5] << 8) |
+                      ((guint32) lu[off + 6] << 16) | ((guint32) lu[off + 7] << 24);
+      guint32 slot = flags & 0xfffff;
+      gsize insn;
+
+      if (slot == 0 || slot >= tst_len)
+        continue;
+
+      insn = (gsize) slot - 1;
+
+      /* Write Register: top two bits 01, reg = (b & 0x3f) * 4 + 0x80002000 */
+      if ((tst[insn] & 0xc0) != 0x40)
+        continue;
+      if (((guint32) (tst[insn] & 0x3f) * 4 + 0x80002000) != reg_want)
+        continue;
+
+      fp_dbg ("calib: line %u flags 0x%08x -> Write Register 0x%08x at 0x%zx: 0x%02x -> 0x%02x",
+              i, flags, reg_want, insn, tst[slot], value);
+      tst[slot] = value;
+      done = TRUE;
     }
 
-  if (match < 0)
-    {
-      fp_dbg ("calib: no Write Register 0x%08x after Call at 0x%" G_GSSIZE_MODIFIER "x",
-              validity_calib_reg (), call_dest);
-      return FALSE;
-    }
+  if (!done)
+    fp_dbg ("calib: no line referenced a Write Register 0x%08x", reg_want);
 
-  fp_dbg ("calib: patching timeslot Write Register at 0x%" G_GSSIZE_MODIFIER "x: 0x%02x -> 0x%02x",
-          match, tst[match + 1], value);
-  tst[match + 1] = value;
-  return TRUE;
+  return done;
 }
 
 /* Walk the capture program's chunk list and patch the 0x34 chunk in place. */
@@ -1812,7 +1841,30 @@ validity_patch_capture_calibration (FpiDeviceValidity0088 *self,
   guint line = validity_calib_line ();
   gsize off;
   guint8 value;
-  gboolean patched = FALSE;
+  guint8 *tst = NULL;
+  gsize tst_len = 0;
+  const guint8 *lu = NULL;
+  gsize lu_len = 0;
+
+  {
+    const gchar *dump = g_getenv ("VALIDITY0088_DUMP_PRG");
+    if (dump != NULL)
+      {
+        g_autoptr(GError) derr = NULL;
+        if (g_file_set_contents (dump, (const gchar *) cmd, (gssize) cmd_len, &derr))
+          fp_dbg ("calib: capture program dumped to %s (%zu B)", dump, cmd_len);
+        else
+          fp_warn ("calib: dump failed: %s", derr->message);
+      }
+  }
+
+  if (g_getenv ("VALIDITY0088_CALIBRATE") != NULL)
+    {
+      /* sensor.py:419 - patch_timeslot_again() is guarded on
+       * `if mode != CaptureMode.CALIBRATE`. Skip it for a calibrate run. */
+      fp_dbg ("calib: CALIBRATE mode, skipping timeslot register patch");
+      return;
+    }
 
   if (self->factory_calib_len == 0)
     {
@@ -1829,18 +1881,6 @@ validity_patch_capture_calibration (FpiDeviceValidity0088 *self,
 
   value = self->factory_calib[line];
 
-  {
-    const gchar *dump = g_getenv ("VALIDITY0088_DUMP_PRG");
-    if (dump != NULL)
-      {
-        g_autoptr(GError) derr = NULL;
-        if (g_file_set_contents (dump, (const gchar *) cmd, (gssize) cmd_len, &derr))
-          fp_dbg ("calib: capture program dumped to %s (%zu B)", dump, cmd_len);
-        else
-          fp_warn ("calib: dump failed: %s", derr->message);
-      }
-  }
-
   /* build_cmd_02: <B opcode><H bytes_per_line><H req_lines> then chunks */
   off = 5;
   while (off + 4 <= cmd_len)
@@ -1856,17 +1896,160 @@ validity_patch_capture_calibration (FpiDeviceValidity0088 *self,
 
       if (typ == 0x34)
         {
-          fp_dbg ("calib: timeslot table 2D chunk at 0x%zx, %u B; line 0x%x -> 0x%02x",
-                  off + 4, sz, line, value);
-          if (validity_patch_timeslot (cmd + off + 4, sz, value))
-            patched = TRUE;
+          tst = cmd + off + 4;
+          tst_len = sz;
+        }
+      else if (typ == 0x30)
+        {
+          lu = cmd + off + 4;
+          lu_len = sz;
         }
 
       off += 4 + sz;
     }
 
-  if (!patched)
-    fp_dbg ("calib: no 0x34 chunk patched in %zu B capture program", cmd_len);
+  if (tst == NULL)
+    {
+      fp_dbg ("calib: no 0x34 timeslot chunk in %zu B capture program", cmd_len);
+      return;
+    }
+
+  fp_dbg ("calib: timeslot table %zu B, line 0x%x -> 0x%02x", tst_len, line, value);
+  validity_patch_timeslot (tst, tst_len, lu, lu_len, value);
+}
+
+/* Which reply-config chunks to drop, as a comma-separated hex list in
+ * VALIDITY0088_DROP_CHUNKS (default "26,2e"). */
+static gboolean
+validity_chunk_is_dropped (guint16 typ)
+{
+  const gchar *env = g_getenv ("VALIDITY0088_DROP_CHUNKS");
+  g_auto(GStrv) parts = NULL;
+
+  if (env == NULL)
+    return typ == 0x26 || typ == 0x2e || typ == 0x4e;
+
+  parts = g_strsplit (env, ",", -1);
+  for (guint i = 0; parts[i] != NULL; i++)
+    {
+      if ((guint16) g_ascii_strtoull (g_strstrip (parts[i]), NULL, 16) == typ)
+        return TRUE;
+    }
+  return FALSE;
+}
+
+/* Turn the driver's single ENROLL capture program into a CALIBRATE one.
+ *
+ * python-validity emits reply-configuration chunks per mode
+ * (sensor.py:424-453): 0x17 always, then 0x26 + 0x2e for ENROLL, 0x4e + 0x2e
+ * for IDENTIFY, and NOTHING for CALIBRATE - the if/elif ladder has no else.
+ * This driver only ever builds the ENROLL variant, so a "calibration" capture
+ * still arms finger-detect (0x26) with the reconstruction engine on (0x2e),
+ * which is exactly the observed "status 0x02 forever, zero bytes on 0x82".
+ *
+ * Drop those two chunks in place and return the new length. */
+static gsize
+validity_strip_enroll_chunks (guint8 *cmd, gsize cmd_len)
+{
+  gsize off = 5;
+  gsize dropped = 0;
+
+  while (off + 4 <= cmd_len)
+    {
+      guint16 typ = (guint16) cmd[off] | ((guint16) cmd[off + 1] << 8);
+      guint16 sz  = (guint16) cmd[off + 2] | ((guint16) cmd[off + 3] << 8);
+      gsize whole = (gsize) 4 + sz;
+
+      if (off + whole > cmd_len)
+        break;
+
+      if (validity_chunk_is_dropped (typ))
+        {
+          fp_dbg ("calib: dropping enroll-only chunk 0x%04x (%u B) at 0x%zx", typ, sz, off);
+          memmove (cmd + off, cmd + off + whole, cmd_len - off - whole);
+          cmd_len -= whole;
+          dropped += whole;
+          continue;
+        }
+
+      off += whole;
+    }
+
+  fp_dbg ("calib: CALIBRATE program is %zu B (dropped %zu B)", cmd_len, dropped);
+  return cmd_len;
+}
+
+/* Strip the FOREIGN device's calibration data out of the template.
+ *
+ * validity-capture-builder.c is not a builder: it is one 18869-byte program
+ * captured from a different physical sensor. That capture carries the other
+ * unit's calibration throughout:
+ *   - 0x34 head, 144 B (line_width): that unit's key line
+ *   - 0x30 tail, 36 x 224 B: that unit's calib_data lines (flags i | 0x85<<24)
+ *
+ * python-validity bootstraps with calib_data EMPTY: get_key_line() returns
+ * line_width zero bytes (sensor.py:409) and the `if len(self.calib_data) > 0`
+ * block at sensor.py:481 emits no calibration lines at all. This reproduces
+ * that shape so the sensor runs against nothing rather than against another
+ * device's numbers.
+ *
+ * 0x30 layout: <u32 count><count x u32 mask, u32 flags><data for group<=1>.
+ * Entries 0-5 are group >1 (their data lives in 0x43); entries 6..41 are the
+ * calibration lines and own all 8064 B of the data section. So truncating to
+ * the first 6 entries drops exactly the foreign data. */
+static gsize
+validity_bootstrap_program (guint8 *cmd, gsize cmd_len)
+{
+  gsize off = 5;
+  guint keep = 6;
+  const gchar *env = g_getenv ("VALIDITY0088_KEEP_LINES");
+  gsize line_width = 144;
+
+  if (env != NULL)
+    keep = (guint) g_ascii_strtoull (env, NULL, 0);
+
+  while (off + 4 <= cmd_len)
+    {
+      guint16 typ = (guint16) cmd[off] | ((guint16) cmd[off + 1] << 8);
+      guint16 sz  = (guint16) cmd[off + 2] | ((guint16) cmd[off + 3] << 8);
+      guint8 *body = cmd + off + 4;
+
+      if (off + 4 + (gsize) sz > cmd_len)
+        break;
+
+      if (typ == 0x34 && sz >= line_width)
+        {
+          fp_dbg ("bootstrap: zeroing %zu B foreign key line at head of 0x34", line_width);
+          memset (body, 0, line_width);
+        }
+      else if (typ == 0x30 && sz >= 4)
+        {
+          guint32 count = (guint32) body[0] | ((guint32) body[1] << 8) |
+                          ((guint32) body[2] << 16) | ((guint32) body[3] << 24);
+          if (count > keep)
+            {
+              gsize new_sz = 4 + (gsize) keep * 8;
+              gsize drop = (gsize) sz - new_sz;
+
+              fp_dbg ("bootstrap: 0x30 %u lines -> %u, dropping %zu B of foreign calib data",
+                      count, keep, drop);
+              body[0] = keep & 0xff;
+              body[1] = (keep >> 8) & 0xff;
+              body[2] = body[3] = 0;
+              cmd[off + 2] = new_sz & 0xff;
+              cmd[off + 3] = (new_sz >> 8) & 0xff;
+              memmove (body + new_sz, body + sz, cmd_len - (off + 4 + sz));
+              cmd_len -= drop;
+              off += 4 + new_sz;
+              continue;
+            }
+        }
+
+      off += 4 + (gsize) sz;
+    }
+
+  fp_dbg ("bootstrap: program is %zu B", cmd_len);
+  return cmd_len;
 }
 
 static void
@@ -2116,7 +2299,7 @@ validity_enroll_run_state (FpiSsm   *ssm,
       if (self->enroll_needs_scan_setup)
         fpi_ssm_next_state (ssm);
       else
-        fpi_ssm_jump_to_state (ssm, ENROLL_S_GLOW_START);
+        fpi_ssm_jump_to_state (ssm, ENROLL_S_CAPTURE_STOP);
       break;
 
     case ENROLL_S_STAGE_SCAN_SETUP:
@@ -2128,6 +2311,27 @@ validity_enroll_run_state (FpiSsm   *ssm,
         if (cmd == NULL) { fpi_ssm_mark_failed (ssm, err); return; }
         validity_ssm_exchange (ssm, device, "enroll-scan-setup",
                                cmd, cmd_len, TRUE, NULL, NULL);
+      }
+      break;
+
+    case ENROLL_S_CAPTURE_STOP:
+      {
+        /* sensor.py:737 - capture() is wrapped in
+         *   finally: tls.app(unhexlify('04'))  # capture stop if still running
+         * The reference sends this after EVERY capture, success or exception.
+         * This driver never sends 0x04 anywhere, so an abandoned program stays
+         * running and the next capture loads on top of a live one. */
+        static const guint8 stop[1] = { 0x04 };
+
+        if (g_getenv ("VALIDITY0088_NO_STOP") != NULL)
+          {
+            fpi_ssm_next_state (ssm);
+            return;
+          }
+
+        fp_dbg ("capture-stop: sending 0x04 to clear any running program");
+        validity_ssm_exchange (ssm, device, "capture-stop",
+                               stop, sizeof (stop), FALSE, NULL, NULL);
       }
       break;
 
@@ -2190,6 +2394,10 @@ validity_enroll_run_state (FpiSsm   *ssm,
                 device, VALIDITY_CAPTURE_MODE_ENROLL, &cmd_len, &err);
         if (cmd == NULL) { fpi_ssm_mark_failed (ssm, err); return; }
         validity_patch_capture_calibration (self, cmd, cmd_len);
+        if (g_getenv ("VALIDITY0088_CALIBRATE") != NULL)
+          cmd_len = validity_strip_enroll_chunks (cmd, cmd_len);
+        if (g_getenv ("VALIDITY0088_BOOTSTRAP") != NULL)
+          cmd_len = validity_bootstrap_program (cmd, cmd_len);
         {
           const gchar *rl = g_getenv ("VALIDITY0088_REQ_LINES");
           if (rl != NULL && cmd_len > 5)
