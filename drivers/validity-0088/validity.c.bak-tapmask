@@ -37,9 +37,6 @@ struct _FpiDeviceValidity0088
   FpiMatchResult     verify_result;
   gint               enroll_completed;
   gint               enroll_attempts;
-  gint               enroll_poll_count;
-  guint8             factory_calib[1024];
-  gsize              factory_calib_len;
   gboolean           enroll_needs_scan_setup;
 };
 
@@ -1149,32 +1146,11 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
   if (event_len >= 1 && event[0] == 0x02)
     fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
 
-  if (event_len >= 3 && event[0] == 0x03)
+  if (event_len >= 3 && event[0] == 0x03 && (event[2] & 0x04))
     {
-      /* python-validity's 0097/009a capture loop breaks on (b[2] & 4).
-       * 0088 is a different (pre-Prometheus) family and never sets that
-       * bit; observed events are 03 40 01 00 00 then 03 41 03 00 40, so
-       * byte 2 looks like an accumulating mask with the terminal bit one
-       * position lower. Override with VALIDITY0088_TAP_MASK (hex) to
-       * probe without a rebuild. */
-      static guint8 tap_mask = 0;
-      if (tap_mask == 0)
-        {
-          const gchar *env = g_getenv ("VALIDITY0088_TAP_MASK");
-          tap_mask = env ? (guint8) g_ascii_strtoull (env, NULL, 16) : 0x04;
-          if (tap_mask == 0)
-            tap_mask = 0x04;
-          fp_dbg ("wait-tap: using capture-complete mask 0x%02x on byte 2", tap_mask);
-        }
-
-      if (event[2] & tap_mask)
-        {
-          fp_dbg ("wait-tap: capture complete (byte2=0x%02x & 0x%02x)",
-                  event[2], tap_mask);
-          fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
-          fpi_ssm_next_state (ssm);
-          return;
-        }
+      fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+      fpi_ssm_next_state (ssm);
+      return;
     }
 
   if (event_len >= 1 && event[0] == 0x00)
@@ -1620,15 +1596,11 @@ validity_verify_ssm_done (FpiSsm   *ssm,
 /* --- Enroll SSM --------------------------------------------------------- */
 
 typedef enum {
-  ENROLL_S_FACTORY_BITS = 0,
-  ENROLL_S_SESSION_PREP,
+  ENROLL_S_SESSION_PREP = 0,
   ENROLL_S_STAGE_BEGIN,
   ENROLL_S_STAGE_SCAN_SETUP,
-  ENROLL_S_GLOW_START,
   ENROLL_S_CAPTURE,
-  ENROLL_S_CALIB_READ,
   ENROLL_S_WAIT_TAP,
-  ENROLL_S_WAIT_PROGRAM,
   ENROLL_S_READ_IMAGE,
   ENROLL_S_DETECT_MINUTIAE,
   ENROLL_S_STAGE_COMMIT,
@@ -1648,363 +1620,6 @@ enroll_bump_attempts_or_fail (FpiSsm *ssm,
       return FALSE;
     }
   return TRUE;
-}
-
-/* Read one burst off the bulk data endpoint (python-validity usb.read_82()).
- * The driver declares VALIDITY_EP_BULK_IN_ALT but never reads it; calibration
- * frames stream out of there with no finger involved, which makes this the
- * cleanest test of whether the sensor scans at all. */
-static void
-enroll_calib_read_cb (FpiUsbTransfer *transfer,
-                      FpDevice       *device,
-                      gpointer        userdata,
-                      GError         *error)
-{
-  FpiSsm *ssm = userdata;
-
-  (void) device;
-
-  if (error)
-    {
-      fp_dbg ("calib-read: EP 0x82 error: %s", error->message);
-      g_error_free (error);
-    }
-  else
-    {
-      g_autofree gchar *hex =
-          validity_hex_prefix (transfer->buffer, transfer->actual_length,
-                               MIN (transfer->actual_length, 32));
-      fp_dbg ("calib-read: EP 0x82 returned %zu B: %s",
-              (gsize) transfer->actual_length, hex);
-    }
-
-  fpi_ssm_next_state (ssm);
-}
-
-/* ===========================================================================
- * Sensor calibration (ported from python-validity)
- *
- * The upstream 0088 driver ships no calibration at all, which is why the
- * capture program runs but the sensor never trips. python-validity:
- *
- *   open():   factory_bits = get_factory_bits(0x0e00)
- *             factory_calibration_values = factory_bits[3][4:]
- *   build_cmd_02() -> line_update_type_1() -> patch_timeslot_again():
- *             inside the 0x34 "Timeslot Table 2D" chunk, follow the last
- *             Call, find the last Write Register to 0x8000203c, and replace
- *             its low operand byte with
- *             factory_calibration_values[key_calibration_line].
- *
- * key_calibration_line is 0x38 for sensor type 0x199 and a guess elsewhere
- * even upstream, so it is overridable here with VALIDITY0088_CALIB_LINE.
- * ========================================================================= */
-
-/* timeslot.py:decode_insn - returns instruction length, sets *opcode. */
-static gsize
-validity_decode_insn (const guint8 *b, gsize avail, gint *opcode)
-{
-  if (avail < 1)
-    return 0;
-
-  if (b[0] <= 4)
-    { *opcode = b[0]; return 1; }
-  if (b[0] >= 5 && b[0] <= 7)
-    { *opcode = b[0]; return 2; }
-  if ((b[0] & 0xfe) == 0x08)
-    { *opcode = 8; return 2; }
-  if ((b[0] & 0xfe) == 0x0a)
-    { *opcode = 9; return 2; }
-  if ((b[0] & 0xfc) == 0x0c)
-    { *opcode = 10; return 1; }
-  if ((b[0] & 0xf8) == 0x10)
-    { *opcode = 11; return 3; }
-  if ((b[0] & 0xe0) == 0x20)
-    { *opcode = 12; return 1; }
-  if ((b[0] & 0xc0) == 0x40)
-    { *opcode = 13; return 3; }
-  if ((b[0] & 0xc0) == 0x80)
-    { *opcode = 14; return 1; }
-  if ((b[0] & 0xc0) == 0xc0)
-    { *opcode = 15; return 2; }
-
-  *opcode = -1;
-  return 0;
-}
-
-static guint32
-validity_calib_reg (void)
-{
-  const gchar *env = g_getenv ("VALIDITY0088_CALIB_REG");
-
-  if (env != NULL)
-    return (guint32) g_ascii_strtoull (env, NULL, 0);
-  return 0x8000203c;
-}
-
-static guint
-validity_calib_line (void)
-{
-  const gchar *env = g_getenv ("VALIDITY0088_CALIB_LINE");
-
-  if (env != NULL)
-    return (guint) g_ascii_strtoull (env, NULL, 0);
-  return 0x38;
-}
-
-/* sensor.py:patch_timeslot_again() over one 0x34 chunk payload. */
-static gboolean
-validity_patch_timeslot (guint8 *tst, gsize tst_len, guint8 value)
-{
-  gsize pc = 0;
-  gssize call_dest = -1;
-  gssize match = -1;
-  gint op;
-  gsize l;
-
-  /* last Call in the table */
-  while (pc < tst_len)
-    {
-      l = validity_decode_insn (tst + pc, tst_len - pc, &op);
-      if (l == 0 || op == 1 || op == 2 || op == 4)
-        break;
-      if (op == 11)
-        call_dest = (gssize) tst[pc + 1] << 2;
-      pc += l;
-    }
-
-  if (call_dest < 0 || (gsize) call_dest >= tst_len)
-    {
-      fp_dbg ("calib: no Call found in timeslot table (dest=%" G_GSSIZE_FORMAT ")", call_dest);
-      return FALSE;
-    }
-
-  /* last Write Register to 0x8000203c after it */
-  pc = (gsize) call_dest;
-  while (pc < tst_len)
-    {
-      l = validity_decode_insn (tst + pc, tst_len - pc, &op);
-      if (l == 0 || op == 1 || op == 2 || op == 4)
-        break;
-      if (op == 13 && ((guint32) (tst[pc] & 0x3f) * 4 + 0x80002000) == validity_calib_reg ())
-        match = (gssize) pc;
-      pc += l;
-    }
-
-  if (match < 0)
-    {
-      fp_dbg ("calib: no Write Register 0x%08x after Call at 0x%" G_GSSIZE_MODIFIER "x",
-              validity_calib_reg (), call_dest);
-      return FALSE;
-    }
-
-  fp_dbg ("calib: patching timeslot Write Register at 0x%" G_GSSIZE_MODIFIER "x: 0x%02x -> 0x%02x",
-          match, tst[match + 1], value);
-  tst[match + 1] = value;
-  return TRUE;
-}
-
-/* Walk the capture program's chunk list and patch the 0x34 chunk in place. */
-static void
-validity_patch_capture_calibration (FpiDeviceValidity0088 *self,
-                                    guint8                *cmd,
-                                    gsize                  cmd_len)
-{
-  guint line = validity_calib_line ();
-  gsize off;
-  guint8 value;
-  gboolean patched = FALSE;
-
-  if (self->factory_calib_len == 0)
-    {
-      fp_dbg ("calib: no factory calibration values, sending program unpatched");
-      return;
-    }
-
-  if (line >= self->factory_calib_len)
-    {
-      fp_warn ("calib: line 0x%x out of range (table is %zu B), skipping patch",
-               line, self->factory_calib_len);
-      return;
-    }
-
-  value = self->factory_calib[line];
-
-  {
-    const gchar *dump = g_getenv ("VALIDITY0088_DUMP_PRG");
-    if (dump != NULL)
-      {
-        g_autoptr(GError) derr = NULL;
-        if (g_file_set_contents (dump, (const gchar *) cmd, (gssize) cmd_len, &derr))
-          fp_dbg ("calib: capture program dumped to %s (%zu B)", dump, cmd_len);
-        else
-          fp_warn ("calib: dump failed: %s", derr->message);
-      }
-  }
-
-  /* build_cmd_02: <B opcode><H bytes_per_line><H req_lines> then chunks */
-  off = 5;
-  while (off + 4 <= cmd_len)
-    {
-      guint16 typ = (guint16) cmd[off] | ((guint16) cmd[off + 1] << 8);
-      guint16 sz  = (guint16) cmd[off + 2] | ((guint16) cmd[off + 3] << 8);
-
-      if (off + 4 + sz > cmd_len)
-        {
-          fp_dbg ("calib: truncated chunk 0x%04x (size %u) at 0x%zx", typ, sz, off);
-          break;
-        }
-
-      if (typ == 0x34)
-        {
-          fp_dbg ("calib: timeslot table 2D chunk at 0x%zx, %u B; line 0x%x -> 0x%02x",
-                  off + 4, sz, line, value);
-          if (validity_patch_timeslot (cmd + off + 4, sz, value))
-            patched = TRUE;
-        }
-
-      off += 4 + sz;
-    }
-
-  if (!patched)
-    fp_dbg ("calib: no 0x34 chunk patched in %zu B capture program", cmd_len);
-}
-
-static void
-enroll_factory_bits_cb (FpDevice     *device,
-                        FpiSsm       *ssm,
-                        const guint8 *plain,
-                        gsize         plain_len,
-                        gpointer      user_data)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-  gsize off;
-  guint32 entries;
-
-  (void) user_data;
-
-  self->factory_calib_len = 0;
-
-  /* status(2) wtf(4) entries(4), then entries of hdr(12) + value */
-  if (plain_len < 10)
-    {
-      fp_warn ("calib: factory bits response too short (%zu B)", plain_len);
-      fpi_ssm_next_state (ssm);
-      return;
-    }
-
-  entries = (guint32) plain[6] | ((guint32) plain[7] << 8) |
-            ((guint32) plain[8] << 16) | ((guint32) plain[9] << 24);
-  fp_dbg ("calib: factory bits: %u entries in %zu B", entries, plain_len);
-
-  off = 10;
-  for (guint32 i = 0; i < entries && off + 12 <= plain_len; i++)
-    {
-      guint16 l      = (guint16) plain[off + 4] | ((guint16) plain[off + 5] << 8);
-      guint16 subtag = (guint16) plain[off + 8] | ((guint16) plain[off + 9] << 8);
-      const guint8 *value = plain + off + 12;
-
-      if (off + 12 + l > plain_len)
-        {
-          fp_warn ("calib: truncated factory bits entry %u", i);
-          break;
-        }
-
-      fp_dbg ("calib:   entry %u subtag 0x%04x len %u", i, subtag, l);
-
-      if (subtag == 3 && l > 4)
-        {
-          gsize n = MIN ((gsize) l - 4, sizeof (self->factory_calib));
-          memcpy (self->factory_calib, value + 4, n);
-          self->factory_calib_len = n;
-          fp_dbg ("calib: factory calibration table: %zu B", n);
-        }
-
-      off += 12 + l;
-    }
-
-  if (self->factory_calib_len == 0)
-    fp_warn ("calib: no subtag 3 in factory bits - capture will run uncalibrated");
-
-  fpi_ssm_next_state (ssm);
-}
-
-/* python-validity sensor.py:wait_till_finished() polls get_prg_status()
- * (0x51 00 00 00 00) until the first response byte is 0 or 7, and only
- * then reads the capture out. This driver skipped the poll and read
- * immediately, which on 0088 returns status 0x0200 - the capture program
- * is still running. Poll interval and cap are overridable for probing. */
-static gboolean
-enroll_poll_program_timeout (gpointer user_data)
-{
-  FpDevice *device = user_data;
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-
-  if (self->task_ssm != NULL)
-    fpi_ssm_jump_to_state (self->task_ssm, ENROLL_S_WAIT_PROGRAM);
-  return G_SOURCE_REMOVE;
-}
-
-static guint
-enroll_poll_interval_ms (void)
-{
-  const gchar *env = g_getenv ("VALIDITY0088_POLL_MS");
-  guint v = env ? (guint) g_ascii_strtoull (env, NULL, 10) : 0;
-
-  return v > 0 ? v : 200;
-}
-
-static gint
-enroll_poll_max (void)
-{
-  const gchar *env = g_getenv ("VALIDITY0088_POLL_MAX");
-  gint v = env ? (gint) g_ascii_strtoll (env, NULL, 10) : 0;
-
-  return v > 0 ? v : 150;
-}
-
-static void
-enroll_wait_program_cb (FpDevice     *device,
-                        FpiSsm       *ssm,
-                        const guint8 *plain,
-                        gsize         plain_len,
-                        gpointer      user_data)
-{
-  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-
-  (void) user_data;
-
-  if (plain_len >= 1)
-    {
-      g_autofree gchar *hex = validity_hex_prefix (plain, plain_len, 16);
-      fp_dbg ("wait-program: poll %d status byte 0x%02x (%zu B: %s)",
-              self->enroll_poll_count, plain[0], plain_len, hex);
-
-      if (plain[0] == 0x00 || plain[0] == 0x07)
-        {
-          fp_dbg ("wait-program: capture program finished after %d polls",
-                  self->enroll_poll_count);
-          fpi_ssm_next_state (ssm);
-          return;
-        }
-    }
-
-  if (++self->enroll_poll_count > enroll_poll_max ())
-    {
-      g_autoptr(GError) retry = g_error_new (FP_DEVICE_RETRY,
-          FP_DEVICE_RETRY_CENTER_FINGER,
-          "capture program did not finish after %d polls",
-          self->enroll_poll_count);
-      fp_dbg ("wait-program: giving up: %s", retry->message);
-      fpi_device_enroll_progress (device, self->enroll_completed, NULL,
-                                  g_steal_pointer (&retry));
-      self->enroll_needs_scan_setup = TRUE;
-      if (!enroll_bump_attempts_or_fail (ssm, self))
-        return;
-      fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
-      return;
-    }
-
-  g_timeout_add (enroll_poll_interval_ms (), enroll_poll_program_timeout, device);
 }
 
 static void
@@ -2097,17 +1712,6 @@ validity_enroll_run_state (FpiSsm   *ssm,
 
   switch ((ValidityEnrollState) fpi_ssm_get_cur_state (ssm))
     {
-    case ENROLL_S_FACTORY_BITS:
-      {
-        /* get_factory_bits(0x0e00): 0x6f, u16 tag, u16 0, u32 0 */
-        static const guint8 cmd[9] = { 0x6f, 0x00, 0x0e, 0x00, 0x00,
-                                       0x00, 0x00, 0x00, 0x00 };
-        validity_ssm_exchange (ssm, device, "enroll-factory-bits",
-                               cmd, sizeof (cmd), FALSE,
-                               enroll_factory_bits_cb, NULL);
-      }
-      break;
-
     case ENROLL_S_SESSION_PREP:
       validity_start_session_prep (device);
       break;
@@ -2116,7 +1720,7 @@ validity_enroll_run_state (FpiSsm   *ssm,
       if (self->enroll_needs_scan_setup)
         fpi_ssm_next_state (ssm);
       else
-        fpi_ssm_jump_to_state (ssm, ENROLL_S_GLOW_START);
+        fpi_ssm_jump_to_state (ssm, ENROLL_S_CAPTURE);
       break;
 
     case ENROLL_S_STAGE_SCAN_SETUP:
@@ -2131,75 +1735,14 @@ validity_enroll_run_state (FpiSsm   *ssm,
       }
       break;
 
-    case ENROLL_S_GLOW_START:
-      {
-        /* python-validity sensor.py:glow_start_scan(), sent immediately
-         * before every capture. The driver's "enroll-scan-setup" payload
-         * (mode f4 01 00 00) is glow_END_scan - the wrong end of the pair,
-         * which matches upstream issue #3 "blue LED only lights short".
-         * Override the whole 125-byte frame with VALIDITY0088_GLOW_START. */
-        static const guint8 glow_start[125] = {
-          0x39, 0x20, 0xbf, 0x02, 0x00, 0xff, 0xff, 0x00,
-          0x00, 0x01, 0x99, 0x00, 0x20, 0x00, 0x00, 0x00,
-          0x00, 0x99, 0x99, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
-          0x00, 0x00, 0x00, 0x99, 0x00, 0x20, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00,
-        };
-        g_autofree guint8 *override = NULL;
-        const guint8 *payload = glow_start;
-        const gchar *env = g_getenv ("VALIDITY0088_GLOW_START");
-
-        if (env != NULL && strlen (env) == 250)
-          {
-            override = g_malloc (125);
-            for (gsize i = 0; i < 125; i++)
-              {
-                gint hi = g_ascii_xdigit_value (env[i * 2]);
-                gint lo = g_ascii_xdigit_value (env[i * 2 + 1]);
-                override[i] = (guint8) ((hi << 4) | lo);
-              }
-            payload = override;
-            fp_dbg ("glow-start: using VALIDITY0088_GLOW_START override");
-          }
-
-        fp_dbg ("glow-start: arming scan (mode %02x%02x%02x%02x)",
-                payload[1], payload[2], payload[3], payload[4]);
-        validity_ssm_exchange (ssm, device, "enroll-glow-start",
-                               payload, 125, TRUE, NULL, NULL);
-      }
-      break;
-
     case ENROLL_S_CAPTURE:
       {
         GError *err = NULL;
-        self->enroll_poll_count = 0;
         gsize cmd_len;
         g_autofree guint8 *cmd =
             validity_build_enroll_capture_command (
                 device, VALIDITY_CAPTURE_MODE_ENROLL, &cmd_len, &err);
         if (cmd == NULL) { fpi_ssm_mark_failed (ssm, err); return; }
-        validity_patch_capture_calibration (self, cmd, cmd_len);
-        {
-          const gchar *rl = g_getenv ("VALIDITY0088_REQ_LINES");
-          if (rl != NULL && cmd_len > 5)
-            {
-              guint16 v = (guint16) g_ascii_strtoull (rl, NULL, 0);
-              cmd[3] = v & 0xff;
-              cmd[4] = (v >> 8) & 0xff;
-              fp_dbg ("calib: req_lines set to %u (calibration capture)", v);
-            }
-        }
         fp_dbg ("enroll stage %d/%d: send capture program",
                 self->enroll_completed + 1, VALIDITY_MAX_ENROLL_STAGES);
         validity_ssm_exchange (ssm, device, "enroll-capture",
@@ -2208,41 +1751,9 @@ validity_enroll_run_state (FpiSsm   *ssm,
       }
       break;
 
-    case ENROLL_S_CALIB_READ:
-      {
-        const gchar *env = g_getenv ("VALIDITY0088_REQ_LINES");
-        FpiUsbTransfer *transfer;
-
-        if (env == NULL)
-          {
-            fpi_ssm_next_state (ssm);
-            return;
-          }
-
-        fp_dbg ("calib-read: reading EP 0x82 for calibration frames");
-        transfer = fpi_usb_transfer_new (device);
-        fpi_usb_transfer_fill_bulk (transfer, VALIDITY_EP_BULK_IN_ALT,
-                                    1024 * 1024);
-        fpi_usb_transfer_submit (transfer, 10000,
-                                 fpi_device_get_cancellable (device),
-                                 enroll_calib_read_cb, ssm);
-      }
-      break;
-
     case ENROLL_S_WAIT_TAP:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       validity_async_submit_interrupt_read (ssm, device);
-      break;
-
-    case ENROLL_S_WAIT_PROGRAM:
-      {
-        gsize cmd_len;
-        g_autofree guint8 *cmd =
-            validity_build_enroll_read_image_command (0x0000, &cmd_len);
-        validity_ssm_exchange (ssm, device, "enroll-prg-status",
-                               cmd, cmd_len, FALSE,
-                               enroll_wait_program_cb, NULL);
-      }
       break;
 
     case ENROLL_S_READ_IMAGE:
