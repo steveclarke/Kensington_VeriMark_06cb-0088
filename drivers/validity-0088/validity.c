@@ -1023,6 +1023,11 @@ validity_async_recv_cb (FpiUsbTransfer *transfer,
     }
 
   fp_dbg ("%s: got %zu B plaintext response", ctx->label, plain_len);
+  if (g_getenv ("VALIDITY0088_DUMP_RESP") != NULL)
+    {
+      g_autofree gchar *hx = validity_hex_prefix (plain, plain_len, plain_len);
+      fp_dbg ("RESPDUMP %s (%zu B): %s", ctx->label, plain_len, hx);
+    }
 
   if (ctx->check_status)
     {
