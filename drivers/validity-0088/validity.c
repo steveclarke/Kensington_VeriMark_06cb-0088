@@ -1158,6 +1158,24 @@ validity_ssm_receive (FpiSsm              *ssm,
                            validity_async_recv_cb, ctx);
 }
 
+typedef enum {
+  ENROLL_S_FACTORY_BITS = 0,
+  ENROLL_S_SESSION_PREP,
+  ENROLL_S_STAGE_BEGIN,
+  ENROLL_S_STAGE_SCAN_SETUP,
+  ENROLL_S_CAPTURE_STOP,
+  ENROLL_S_GLOW_START,
+  ENROLL_S_CAPTURE,
+  ENROLL_S_CALIB_READ,
+  ENROLL_S_WAIT_TAP,
+  ENROLL_S_WAIT_PROGRAM,
+  ENROLL_S_READ_IMAGE,
+  ENROLL_S_DETECT_MINUTIAE,
+  ENROLL_S_STAGE_COMMIT,
+  ENROLL_NUM_STATES,
+} ValidityEnrollState;
+
+static gboolean enroll_bump_attempts_or_fail (FpiSsm *ssm, FpiDeviceValidity0088 *self);
 static void validity_async_submit_interrupt_read (FpiSsm *ssm, FpDevice *device);
 
 static void
@@ -1185,6 +1203,42 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
 
   if (event_len >= 1 && event[0] == 0x02)
     fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+
+  /* VALIDITY0088_WIN_FLOW: the Windows driver's EP 0x83 state machine, from
+   * the USBPcap enroll capture (23 rounds, fully deterministic):
+   *   03 40 -> 03 41 (finger arriving) -> 03 43 (finger settled) => image
+   *   03 42                                                        => image
+   *   03 60                                                        => rejected
+   * It sends the read-image command only after 43/42. The mask test below
+   * fires on 03 41 - too early - which is why the sensor never answered. */
+  if (event_len >= 2 && event[0] == 0x03 &&
+      g_getenv ("VALIDITY0088_WIN_FLOW") != NULL)
+    {
+      if (event[1] == 0x43 || event[1] == 0x42)
+        {
+          fp_dbg ("win-flow: finger settled (03 %02x), requesting image", event[1]);
+          fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+          fpi_ssm_next_state (ssm);
+          return;
+        }
+      if (event[1] == 0x60)
+        {
+          FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+          fp_dbg ("win-flow: sensor rejected the touch (03 60), retrying");
+          fpi_device_enroll_progress (device, self->enroll_completed, NULL,
+              fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
+                                        "Touch rejected, please try again"));
+          self->enroll_needs_scan_setup = TRUE;
+          if (!enroll_bump_attempts_or_fail (ssm, self))
+            return;
+          fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+          return;
+        }
+      if (event[1] == 0x41)
+        fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+      validity_async_submit_interrupt_read (ssm, device);
+      return;
+    }
 
   if (event_len >= 3 && event[0] == 0x03)
     {
@@ -1668,22 +1722,6 @@ validity_verify_ssm_done (FpiSsm   *ssm,
 
 /* --- Enroll SSM --------------------------------------------------------- */
 
-typedef enum {
-  ENROLL_S_FACTORY_BITS = 0,
-  ENROLL_S_SESSION_PREP,
-  ENROLL_S_STAGE_BEGIN,
-  ENROLL_S_STAGE_SCAN_SETUP,
-  ENROLL_S_CAPTURE_STOP,
-  ENROLL_S_GLOW_START,
-  ENROLL_S_CAPTURE,
-  ENROLL_S_CALIB_READ,
-  ENROLL_S_WAIT_TAP,
-  ENROLL_S_WAIT_PROGRAM,
-  ENROLL_S_READ_IMAGE,
-  ENROLL_S_DETECT_MINUTIAE,
-  ENROLL_S_STAGE_COMMIT,
-  ENROLL_NUM_STATES,
-} ValidityEnrollState;
 
 static gboolean
 enroll_bump_attempts_or_fail (FpiSsm *ssm,
@@ -2529,10 +2567,11 @@ validity_enroll_run_state (FpiSsm   *ssm,
     case ENROLL_S_WAIT_PROGRAM:
       if (g_getenv ("VALIDITY0088_WIN_FLOW") != NULL)
         {
-          /* Windows flow: no status poll, no read-image command. Just wait
-           * for the sensor to push the image record on EP 0x81. */
-          validity_ssm_receive (ssm, device, "enroll-win-recv", 20000,
-                                enroll_win_recv_cb, NULL);
+          /* Windows flow: no status poll. The finger-settled interrupt
+           * (03 43) already fired; go straight to the read-image command,
+           * which is the 64-byte TLS record Windows sends at that moment. */
+          fp_dbg ("win-flow: skipping status poll, sending read-image");
+          fpi_ssm_next_state (ssm);
           break;
         }
       {
