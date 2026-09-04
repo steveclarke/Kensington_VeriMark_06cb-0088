@@ -34,11 +34,16 @@ LIB_DIR="$BUILD_DIR/libfprint"
 [ -f "$LIB_DIR/libfprint-2.so.2.0.0" ] \
     || die "libfprint-2.so.2.0.0 not found in $LIB_DIR — did 'meson compile' run?"
 
-if ! nm "$LIB_DIR/libfprint-2.so.2.0.0" 2>/dev/null \
-        | grep -q "fpi_device_validity_0088_get_type"; then
-    die "the libfprint at $LIB_DIR does not include the validity-0088 driver — \
-re-run 'meson setup --wipe builddir -Ddrivers=validity_0088' and rebuild"
-fi
+# NB: do not pipe nm into `grep -q` here. `grep -q` exits at the first match
+# and closes the pipe, nm dies of SIGPIPE (141), and `set -o pipefail` then
+# reports the whole pipeline as failed - so the check inverts and rejects a
+# perfectly good build. Read the symbols into a variable instead.
+NM_OUT="$(nm "$LIB_DIR/libfprint-2.so.2.0.0" 2>/dev/null || true)"
+case "$NM_OUT" in
+    *fpi_device_validity_0088_get_type*) ;;
+    *) die "the libfprint at $LIB_DIR does not include the validity-0088 driver — \
+re-run 'meson setup --wipe builddir -Ddrivers=validity_0088' and rebuild" ;;
+esac
 
 # Check fprintd unit exists
 systemctl cat fprintd.service >/dev/null 2>&1 \
