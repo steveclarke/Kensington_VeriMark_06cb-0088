@@ -1214,7 +1214,7 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
   if (event_len >= 2 && event[0] == 0x03 &&
       g_getenv ("VALIDITY0088_WIN_FLOW") != NULL)
     {
-      if (event[1] == 0x43 || event[1] == 0x42)
+      if (event[1] >= 0x42 && event[1] <= 0x4f)
         {
           fp_dbg ("win-flow: finger settled (03 %02x), requesting image", event[1]);
           fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);

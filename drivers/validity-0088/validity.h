@@ -157,8 +157,19 @@ const guint8 *validity_pick_rsa_modulus_for_device_id (const guint8 device_prefi
  * AES-CBC + padding + HMAC-SHA-256).
  * ========================================================================= */
 
-#define VALIDITY_IMAGE_WIDTH        56
-#define VALIDITY_IMAGE_HEIGHT      144
+/* Header fields as the device reports them (used for record validation). */
+#define VALIDITY_IMAGE_HDR_WIDTH    56
+#define VALIDITY_IMAGE_HDR_HEIGHT  144
+
+/* Actual pixel layout. The stream is row-major with 144-pixel scan lines and
+ * 56 lines (line_width = 144, 56 lines per frame - the same geometry as the
+ * calibration table). The header's width/height labels are transposed
+ * relative to the data: rendering 56-wide destroys the image. Verified by
+ * autocorrelation on captured frames - as 56x144 the frame correlates 0.50
+ * along rows and 0.68 down columns; read 144x56 it correlates only along
+ * rows (0.44) and not at all down columns (-0.10). */
+#define VALIDITY_IMAGE_WIDTH       144
+#define VALIDITY_IMAGE_HEIGHT       56
 #define VALIDITY_IMAGE_HEADER_LEN   18
 #define VALIDITY_IMAGE_DATA_LEN    (VALIDITY_IMAGE_WIDTH * VALIDITY_IMAGE_HEIGHT)  /* 8064 */
 #define VALIDITY_IMAGE_RECORD_LEN  (VALIDITY_IMAGE_HEADER_LEN + VALIDITY_IMAGE_DATA_LEN)  /* 8082 */
@@ -181,8 +192,8 @@ validity_image_record_validate (const ValidityImageRecord *img)
 {
   return (img->type == 0
           && img->payload_len == 0x1f8c
-          && img->width  == VALIDITY_IMAGE_WIDTH
-          && img->height == VALIDITY_IMAGE_HEIGHT
+          && img->width  == VALIDITY_IMAGE_HDR_WIDTH
+          && img->height == VALIDITY_IMAGE_HDR_HEIGHT
           && img->bpp    == 8);
 }
 
