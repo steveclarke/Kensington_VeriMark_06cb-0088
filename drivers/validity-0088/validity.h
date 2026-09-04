@@ -28,7 +28,11 @@ G_DECLARE_FINAL_TYPE (FpiDeviceValidity0088, fpi_device_validity_0088, FPI, DEVI
 #define VALIDITY_USB_INTERRUPT_TIMEOUT 60000
 
 #define VALIDITY_MAX_RECV_LEN          24576  /* > 18960 to fit per-attempt records */
-#define VALIDITY_MAX_ENROLL_STAGES        10
+/* The device reboots itself roughly every other open, which at 10 stages
+ * usually lands mid-enrollment and fails the whole run. 5 is within the normal
+ * range for libfprint drivers and completes before a reboot far more often.
+ * Override at runtime with VALIDITY0088_ENROLL_STAGES. */
+#define VALIDITY_MAX_ENROLL_STAGES        5
 
 /* ===========================================================================
  * Protocol constants

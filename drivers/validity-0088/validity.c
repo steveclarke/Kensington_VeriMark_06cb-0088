@@ -1212,7 +1212,7 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
    * It sends the read-image command only after 43/42. The mask test below
    * fires on 03 41 - too early - which is why the sensor never answered. */
   if (event_len >= 2 && event[0] == 0x03 &&
-      g_getenv ("VALIDITY0088_WIN_FLOW") != NULL)
+      g_getenv ("VALIDITY0088_LEGACY_FLOW") == NULL)
     {
       if (event[1] >= 0x42 && event[1] <= 0x4f)
         {
@@ -1224,14 +1224,16 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
       if (event[1] == 0x60)
         {
           FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
-          fp_dbg ("win-flow: sensor rejected the touch (03 60), retrying");
-          fpi_device_enroll_progress (device, self->enroll_completed, NULL,
-              fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
-                                        "Touch rejected, please try again"));
+          /* Windows drains a rejected touch before starting the next round:
+           * it still sends the read-image command and reads the short reply,
+           * rather than abandoning the capture. Jumping straight back to
+           * STAGE_BEGIN leaves the device mid-capture and it reboots itself
+           * ("device was disconnected"). Go through READ_IMAGE instead - the
+           * short response lands in enroll_read_image_cb, which reports the
+           * retry and returns to STAGE_BEGIN for us. */
+          fp_dbg ("win-flow: sensor rejected the touch (03 60), draining");
           self->enroll_needs_scan_setup = TRUE;
-          if (!enroll_bump_attempts_or_fail (ssm, self))
-            return;
-          fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+          fpi_ssm_jump_to_state (ssm, ENROLL_S_READ_IMAGE);
           return;
         }
       if (event[1] == 0x41)
@@ -1252,7 +1254,7 @@ validity_async_interrupt_cb (FpiUsbTransfer *transfer,
       if (tap_mask == 0)
         {
           const gchar *env = g_getenv ("VALIDITY0088_TAP_MASK");
-          tap_mask = env ? (guint8) g_ascii_strtoull (env, NULL, 16) : 0x04;
+          tap_mask = env ? (guint8) g_ascii_strtoull (env, NULL, 16) : 0x02;
           if (tap_mask == 0)
             tap_mask = 0x04;
           fp_dbg ("wait-tap: using capture-complete mask 0x%02x on byte 2", tap_mask);
@@ -1836,7 +1838,10 @@ validity_calib_line (void)
 
   if (env != NULL)
     return (guint) g_ascii_strtoull (env, NULL, 0);
-  return 0x38;
+  /* 0x38 is python-validity's hardcoded value for sensor type 0x199 and is one
+   * past the end of this device's 56-entry table. The correct index is the
+   * middle of the table. */
+  return 0x1c;
 }
 
 /* Locate the calibration Write Register via the program's own line_update
@@ -2565,7 +2570,7 @@ validity_enroll_run_state (FpiSsm   *ssm,
       break;
 
     case ENROLL_S_WAIT_PROGRAM:
-      if (g_getenv ("VALIDITY0088_WIN_FLOW") != NULL)
+      if (g_getenv ("VALIDITY0088_LEGACY_FLOW") == NULL)
         {
           /* Windows flow: no status poll. The finger-settled interrupt
            * (03 43) already fired; go straight to the read-image command,
@@ -2589,8 +2594,14 @@ validity_enroll_run_state (FpiSsm   *ssm,
         gsize cmd_len;
         g_autofree guint8 *cmd =
             validity_build_enroll_read_image_command (0x2000, &cmd_len);
+        /* check_status = FALSE: a rejected touch answers this command with a
+         * short status record (0x0700 observed) rather than an image. That is
+         * normal - Windows reads it and moves on. Let enroll_read_image_cb
+         * see it; it treats any non-image response as a retry. Checking the
+         * status here turns an ordinary rejected touch into a fatal error and
+         * the device reboots. */
         validity_ssm_exchange (ssm, device, "enroll-read-image",
-                               cmd, cmd_len, TRUE,
+                               cmd, cmd_len, FALSE,
                                enroll_read_image_cb, NULL);
       }
       break;
