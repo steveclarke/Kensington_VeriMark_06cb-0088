@@ -613,14 +613,23 @@ validity_get_image_scale (void)
   gchar *end = NULL;
   guint64 value;
 
+  /* The sensor images a small area (144x56). NBIS assumes roughly 500 ppi and
+   * finds almost nothing at native size: measured on a captured frame,
+   * 1x yields 2 minutiae, 2x yields 16, 6x yields 83. The device's own
+   * feature extractor reports ~70 for the same press, so 6x is the scale at
+   * which the host matcher recovers what the hardware actually sees.
+   * Bilinear is worse than nearest at every scale (6 vs 25 at 4x) - NBIS keys
+   * on hard ridge edges and smoothing destroys them, so keep nearest.
+   * Scaling far beyond this inflates the count with artifacts of the
+   * upscaling rather than real ridge features. */
   if (env == NULL || env[0] == '\0')
-    return 2;
+    return 6;
 
   value = g_ascii_strtoull (env, &end, 10);
-  if (end == env || *end != '\0' || value == 0 || value > 4)
+  if (end == env || *end != '\0' || value == 0 || value > 16)
     {
       fp_warn ("ignoring invalid VALIDITY0088_IMAGE_SCALE=%s", env);
-      return 2;
+      return 6;
     }
 
   return (guint) value;
