@@ -1126,6 +1126,38 @@ validity_ssm_exchange (FpiSsm              *ssm,
                            validity_async_send_cb, ctx);
 }
 
+/* Receive-only: one bulk IN on the command endpoint, decrypted and handed to
+ * cb, with NO preceding command. The Windows driver never sends a read-image
+ * command: after the capture program's reply, the 8,149 B image record simply
+ * arrives on EP 0x81 once a finger is scanned (USBPcap, verimark-fingerprint-
+ * windows.md). Reuses validity_async_recv_cb for the decrypt + dispatch. */
+static void
+validity_ssm_receive (FpiSsm              *ssm,
+                      FpDevice            *device,
+                      const gchar         *label,
+                      guint                timeout_ms,
+                      ValidityAsyncRecvCb  cb,
+                      gpointer             cb_data)
+{
+  ValidityExchangeCtx *ctx;
+  FpiUsbTransfer *recv;
+
+  ctx = g_new (ValidityExchangeCtx, 1);
+  ctx->ssm          = ssm;
+  ctx->cb           = cb;
+  ctx->cb_data      = cb_data;
+  ctx->label        = label;
+  ctx->check_status = FALSE;
+
+  fp_dbg ("%s: bare receive on EP 0x81 (no command), timeout %u ms",
+          label, timeout_ms);
+  recv = fpi_usb_transfer_new (device);
+  fpi_usb_transfer_fill_bulk (recv, VALIDITY_EP_CMD_IN, VALIDITY_MAX_RECV_LEN);
+  fpi_usb_transfer_submit (recv, timeout_ms,
+                           fpi_device_get_cancellable (device),
+                           validity_async_recv_cb, ctx);
+}
+
 static void validity_async_submit_interrupt_read (FpiSsm *ssm, FpDevice *device);
 
 static void
@@ -2235,6 +2267,53 @@ enroll_read_image_cb (FpDevice     *device,
   fpi_ssm_next_state (ssm);
 }
 
+/* VALIDITY0088_WIN_FLOW: consume the image that arrives unbidden on EP 0x81
+ * after the tap, the way Windows does. Same acceptance logic as
+ * enroll_read_image_cb but jumps straight to minutiae detection, since the
+ * next enum state (READ_IMAGE) would send a command Windows never sends. */
+static void
+enroll_win_recv_cb (FpDevice     *device,
+                    FpiSsm       *ssm,
+                    const guint8 *plain,
+                    gsize         plain_len,
+                    gpointer      user_data)
+{
+  FpiDeviceValidity0088 *self = FPI_DEVICE_VALIDITY_0088 (device);
+  GError *err = NULL;
+  FpImage *image;
+  g_autofree gchar *hex = validity_hex_prefix (plain, plain_len,
+                                               MIN (plain_len, 32));
+
+  fp_dbg ("win-flow: EP 0x81 delivered %zu B plaintext: %s", plain_len, hex);
+
+  if (plain_len != VALIDITY_IMAGE_RECORD_LEN)
+    {
+      g_autoptr(GError) retry = g_error_new (FP_DEVICE_RETRY,
+          FP_DEVICE_RETRY_TOO_SHORT,
+          "win-flow: not an image record (%zu B: %s)", plain_len, hex);
+      fp_dbg ("enroll capture retry: %s", retry->message);
+      fpi_device_enroll_progress (device, self->enroll_completed, NULL,
+                                  g_steal_pointer (&retry));
+      self->enroll_needs_scan_setup = TRUE;
+      if (!enroll_bump_attempts_or_fail (ssm, self))
+        return;
+      fpi_ssm_jump_to_state (ssm, ENROLL_S_STAGE_BEGIN);
+      return;
+    }
+
+  image = validity_image_from_plaintext (plain, plain_len, &err);
+  if (image == NULL)
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+
+  g_clear_object (&self->captured_image);
+  self->captured_image = image;
+  fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
+  fpi_ssm_jump_to_state (ssm, ENROLL_S_DETECT_MINUTIAE);
+}
+
 static void
 enroll_detect_minutiae_cb (GObject      *source,
                            GAsyncResult *res,
@@ -2448,6 +2527,14 @@ validity_enroll_run_state (FpiSsm   *ssm,
       break;
 
     case ENROLL_S_WAIT_PROGRAM:
+      if (g_getenv ("VALIDITY0088_WIN_FLOW") != NULL)
+        {
+          /* Windows flow: no status poll, no read-image command. Just wait
+           * for the sensor to push the image record on EP 0x81. */
+          validity_ssm_receive (ssm, device, "enroll-win-recv", 20000,
+                                enroll_win_recv_cb, NULL);
+          break;
+        }
       {
         gsize cmd_len;
         g_autofree guint8 *cmd =
