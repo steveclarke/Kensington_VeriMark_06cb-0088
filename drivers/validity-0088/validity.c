@@ -1527,6 +1527,16 @@ verify_read_image_cb (FpDevice     *device,
       return;
     }
 
+  {
+    const gchar *dir = g_getenv ("VALIDITY0088_DUMP_FRAMES");
+    if (dir != NULL && dir[0] != '\0')
+      {
+        static guint seq = 0;
+        g_autofree gchar *path = g_strdup_printf ("%s/frame-%03u.bin", dir, seq++);
+        g_file_set_contents (path, (const gchar *) plain, plain_len, NULL);
+        fp_dbg ("dumped raw image record to %s", path);
+      }
+  }
   g_clear_object (&self->captured_image);
   self->captured_image = image;
   fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
@@ -1648,6 +1658,25 @@ validity_verify_run_state (FpiSsm   *ssm,
         fp_dbg ("verify result: %s (bz3 threshold=%d)",
                 self->verify_result == FPI_MATCH_SUCCESS ? "MATCH" : "NO_MATCH",
                 validity_get_bz3_threshold ());
+        /* Diagnostic only - bracket the bozorth3 score without changing the
+         * verdict. fpi_print_bz3_match does not expose the score, so probe
+         * descending thresholds and report the highest one that passes. */
+        {
+          static const gint probes[] = { 40, 35, 30, 25, 20, 15, 10, 5, 1 };
+          gint best = 0;
+          for (gsize i = 0; i < G_N_ELEMENTS (probes); i++)
+            {
+              GError *e2 = NULL;
+              if (fpi_print_bz3_match (enrolled, self->stage_print,
+                                       probes[i], &e2) == FPI_MATCH_SUCCESS)
+                { best = probes[i]; break; }
+              g_clear_error (&e2);
+            }
+          fp_dbg ("verify diag: probe minutiae=%u, bz3 score is >= %d "
+                  "(highest passing probe threshold; 0 = below 1)",
+                  fp_image_get_minutiae (self->captured_image) ?
+                    fp_image_get_minutiae (self->captured_image)->len : 0, best);
+        }
         fpi_ssm_next_state (ssm);
       }
       break;
@@ -2313,6 +2342,16 @@ enroll_read_image_cb (FpDevice     *device,
       return;
     }
 
+  {
+    const gchar *dir = g_getenv ("VALIDITY0088_DUMP_FRAMES");
+    if (dir != NULL && dir[0] != '\0')
+      {
+        static guint seq = 0;
+        g_autofree gchar *path = g_strdup_printf ("%s/frame-%03u.bin", dir, seq++);
+        g_file_set_contents (path, (const gchar *) plain, plain_len, NULL);
+        fp_dbg ("dumped raw image record to %s", path);
+      }
+  }
   g_clear_object (&self->captured_image);
   self->captured_image = image;
   fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
@@ -2360,6 +2399,16 @@ enroll_win_recv_cb (FpDevice     *device,
       return;
     }
 
+  {
+    const gchar *dir = g_getenv ("VALIDITY0088_DUMP_FRAMES");
+    if (dir != NULL && dir[0] != '\0')
+      {
+        static guint seq = 0;
+        g_autofree gchar *path = g_strdup_printf ("%s/frame-%03u.bin", dir, seq++);
+        g_file_set_contents (path, (const gchar *) plain, plain_len, NULL);
+        fp_dbg ("dumped raw image record to %s", path);
+      }
+  }
   g_clear_object (&self->captured_image);
   self->captured_image = image;
   fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
