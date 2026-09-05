@@ -623,13 +623,13 @@ validity_get_image_scale (void)
    * Scaling far beyond this inflates the count with artifacts of the
    * upscaling rather than real ridge features. */
   if (env == NULL || env[0] == '\0')
-    return 6;
+    return 5;
 
   value = g_ascii_strtoull (env, &end, 10);
   if (end == env || *end != '\0' || value == 0 || value > 16)
     {
       fp_warn ("ignoring invalid VALIDITY0088_IMAGE_SCALE=%s", env);
-      return 6;
+      return 5;
     }
 
   return (guint) value;
